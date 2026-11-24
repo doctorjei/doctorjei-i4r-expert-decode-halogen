@@ -4,6 +4,8 @@
 ## Overview
 This is a functional description of how halogen, Peonist LLC's inference engine, runs the routed-expert step of a mixture-of-experts model during decode, for weights in the i4r format: 4-bit values with one f16 scale per 128 values, in a 128-point Hadamard basis.
 
+**Companion document:** [ht dense decode specification](ht-dense-decode.md) covers the engine's dense matrix-vector products (attention and linear-attention projections, output head, shared expert) for weights in the ht trellis format.
+
 **Methods.** clean-room style; one actor studied the engine and wrote this description. A second actor reviewed to ensure no 'bleed over' into the clean specification. (The halogen license does not prohibit reverse engineering but does ask that derived source or kernels not be redistributed as one's own work; this document contains neither.)
 
 **Numbers.** Absolute timings / throughput are deliberately omitted, per request in the halogen license (which asks that published figures name software version and prompt - and which are not relevant to this document). Out of respect for that request...
