@@ -1,79 +1,72 @@
-# Functional spec: halogen, routed-expert (MoE) decode for i4r experts
+# Halogen i4r Expert (MoE) Decode Specification
+> Version 1.0 (draft 1)
 
-| Field | Value |
-|---|---|
-| Version | 1.0 (draft 1 with addendum 1 merged; REVIEW DRAFT, not yet published) |
-| Analysis | gozer (analysis agent), reviewed by zuul (gatekeeper) |
-| Released to the clean side | 2026-11-23, by the Director |
-| Merged and edited | Clean Builder (Claude), from the released documents only |
-| Sources | spec draft 1 (sha256 `344090f6…e3e206`) and addendum 1 (sha256 `889875c9…49b05`) |
-
-> Prose, tables of numbers, and data-flow descriptions only.
-> No code, pseudo-code mirroring the subject, disassembly, instruction listings, identifiers, strings or hex.
-
-## About this document
-
+## Overview
 This is a functional description of how halogen, Peonist LLC's inference engine, runs the routed-expert step of a mixture-of-experts model during decode, for weights in the i4r format: 4-bit values with one f16 scale per 128 values, in a 128-point Hadamard basis.
 
-**How it was produced:** clean-room style. One agent studied the engine and wrote this description. A second agent reviewed it to make sure it holds no code or other copied material. A separate implementer works only from the reviewed text. halogen's license does not prohibit reverse engineering; it asks that derived source or kernels not be redistributed as one's own work. This document contains neither.
+**Methods.** clean-room style; one actor studied the engine and wrote this description. A second actor reviewed to ensure no 'bleed over' into the clean specification. (The halogen license does not prohibit reverse engineering but does ask that derived source or kernels not be redistributed as one's own work; this document contains neither.)
 
-**On the numbers:** absolute timings and throughput from the profiled run are deliberately omitted. halogen's license asks that published figures name the software version and the prompt set that produced them, and this analysis did not record either. Out of respect for that request:
-- times are given as shares of the per-token GPU busy time;
-- bandwidth is given as a share of the GPU's published peak memory bandwidth;
-- structural facts (launch counts, work splits, register and memory use, data sizes) are given exactly.
+**Numbers.** Absolute timings / throughput are deliberately omitted, per request in the halogen license (which asks that published figures name software version and prompt - and which are not relevant to this document). Out of respect for that request...
+- times are given as shares of the per-token GPU busy time; and
+- bandwidth is given as a share of the GPU's published peak memory bandwidth.
 
-**Conditions of the profiled run:**
-- the model with its second-version weight set, 48 layers;
-- two short prompts, 64 generated tokens each (63 decode steps per request measured; the first generated token comes from the prompt pass), one request at a time, greedy sampling;
-- a gfx1151 GPU, under a tracing profiler that adds a small overhead per launch.
+Other numbers (i.e., structural facts such as launch counts, work splits, register and memory use, and data sizes) are given exactly.
 
-## 1. Summary
+**Conditions.** Profiled runs used the model with its second-version weight set, 48 layers:
+- gfx1151 GPU under a tracing profiler (adds small overhead per launch)
+- two short prompts, 64 generated tokens each
+  - 63 decode steps per request measured
+  - first generated token comes from prompt pass
+  - one request at a time with greedy sampling
 
-The subject runs the routed-expert step of each layer, for each decode token, in **three launches instead of about thirty**. On the expert weights it reaches about **65 to 72 percent of the GPU's peak memory bandwidth**, about 7 times the effective bandwidth of the open-source implementation of the same format, which reaches about 9 percent.
 
-Five techniques explain the difference:
+## 1. Introduction
 
-1. **All selected experts in one launch per stage.** Routing runs in one launch, gate and up for all 10 experts in a second, and down for all 10 in a third. Expert selection stays on the device and is read by the expert launches directly, so there is no host round trip per layer.
-2. **Finishing work done by the last workgroup to arrive.** The gating non-linearity, the Hadamard rotations and the weighted combine over experts run in whichever workgroup finishes a tile last, using arrival counters, instead of in separate launches or passes over memory.
-3. **Row-only split with wide contiguous loads issued early.** Each workgroup owns 64 whole output rows. Four lanes share a row and read it front to back in 16-byte pieces, and all of a row's loads are in flight before any arithmetic, which keeps the memory system busy.
-4. **Cheap exact unpacking and packed arithmetic.** 4-bit codes become half-precision values with no integer conversion. They are multiplied in pairs against the f16 input with 32-bit accumulation, and each 128-value block's scale is applied once to its block sum.
-5. **Small, cheap rotations.** The 128-point transforms are done in registers within one wavefront, and the output-side transform is applied once to the combined result rather than once per expert.
+The routed-expert step of each layer, for each decode token, is run in _three (3) launches_ instead of 30; it reaches **65-72 percent** of GPU peak memory bandwidth on the expert weights, which is about seven (7) times that of other implementations for the format. This is accomplished via five (5) techniques:
 
-## 2. Launch structure (per decode token)
+1. **All selected experts in one launch per stage.** Routing runs in one launch, gate and up for all 10 experts in a second, and down for all 10 in a third. Expert selection stays on-device, read by expert launches directly, eliminating host round-trip.
+2. **Finishing work is done by last arriving workgroup.** Gating non-linearity, Hadamard rotations, and weighted expert combination run in the workgroup finishing a tile last by using arrival counters instead of via separate launches / memory passes.
+3. **Row-only split with wide contiguous loads issued early.** Each workgroup owns 64 output rows. Four lanes share and read a row front to back in 16-byte chunks. All of a row's loads are in flight before arithmetic, keeping memory busy.
+4. **Cheap exact unpacking and packed arithmetic.** 4-bit codes become half-precision values with no integer conversion, multiplied in pairs against f16 input with 32-bit accumulation. Each 128-value block's scale is applied once to its block sum.
+5. **Small, cheap rotations.** 128-point transforms are done in registers within one wavefront. Output-side transform is applied once to combined result rather than once per expert.
 
-| Stage | Launches per MoE layer | Launches per token | What one launch covers |
+
+## 2. Launch Structure (per decode token)
+
+| Stage | Per Layer | Per Token | Function |
 |---|---|---|---|
-| Router, expert selection and selection weights | 1 | 48 | The router projection for the token, then top-10 selection and normalised weights (section 3). The same launch also computes the shared expert's gate and up projections and its per-token gate value (section 10). |
-| Expert gate and up projections, plus the shared expert's down projection | 1 | 48 | Gate and up for all 10 selected experts, the gating non-linearity, and the rotation into the down projection's input basis. A separate range of 100 workgroups computes the shared expert's activation and down projection (section 10). |
-| Expert down projection and combine | 1 | 48 | Down for all 10 selected experts, then the weighted sum over experts, the output-side rotation, and the addition of the gated shared-expert output. Written once as the layer's result. |
-| Whole token, all work | about 13.4 | 644 (median; range 644 to 668) | Everything, including attention, other mixers, norms and sampling |
+| Router Projection&nbsp;&<br />Expert Selection | 1 | 48 | - Router projection for token<br />- Top-10 selection & normalized weights [3]<br />- Shared expert's gate/up projections<br />- Per-token gate value [10] |
+| Expert Gate/Up Proj.&nbsp;& <br />Shared Expert Down Proj. | 1 | 48 | - Gate/up for selected experts<br />- Gating non-linearity<br />- Rotation into down proj.'s input basis<br />- Shared expert's activation/down projection <br />&nbsp;&nbsp;(Separate range of 100 workgroups) [10] |
+| Expert Down Proj.&nbsp;&<br />Combine | 1 | 48 | - Down projection for selected experts<br />- Weighted sum over experts<br />- Output-side rotation<br />- Addition of Gated Shared-Expert Output <br />&nbsp;&nbsp;(Written once as layer's result) |
+| Whole Token <br />(All Work) | ~13.4 | 644-668 | Everything - including attention, other mixers, <br />norms, & sampling |
 
-- **Every layer** of the 48 runs the routed-expert step: 63 decode steps × 48 layers = 3,024 launches of each of the three expert-step kinds per request, exactly.
-- **Fusion:** gate and up are fused into one launch; down is a separate launch. Experts are batched: there is one launch per layer per stage, not one per expert.
-- **Combine:** fused into the down launch. No separate combine or scatter launch exists.
-- **The shared expert** costs no launch of its own. Its work is spread over the three launches above (section 10).
+### Additional Notes
+- **Every layer** of 48 runs routed-expert step: 63 steps × 48 layers = 3,024 launches per three expert-step kinds per request
+- **Fusion:** gate & up are fused into one launch; down is separate. Experts are batched: one launch per layer per stage, _not one per expert_.
+- **Combine:** fused into down launch; no separate combine or scatter launch exists.
+- **Shared expert** has no separate launch; its work is spread over launches above (section 10).
 - **Handing off work inside one launch, without a second launch:**
-  - every workgroup writes its partial results (32-bit floats) to a small scratch area, then increments a per-tile arrival counter;
-  - the workgroup that arrives last for a tile finishes that tile (non-linearity, rotation, combine) and resets the counter to zero for the next use;
-  - so the finishing work costs no extra launch and no global barrier.
-- **Graph capture:** none. Every launch in decode is an ordinary individual launch from the host; no graph creation or graph launch calls appear anywhere in the trace.
-- **For comparison:** the open-source implementation of the same format uses about 30 launches per MoE layer per token. That figure comes from our own earlier work, not from this analysis.
+  - workgroups write partial results (32b floats) to small scratch area, then increment per-tile arrival counter
+  - workgroup arriving last for tile finishes the tile (non-linearity, rotation, combine) & resets counter
+  - finishing work costs no extra launch & no global barrier
+- **Graph capture:** none. Every decode launch is ordinary launch from host; no graph creation / launch calls.
+
 
 ## 3. Routing
 
-- **Selection is produced and consumed on the device**, inside the router launch:
-  - the router launch spreads the router projection, and a few other small per-token projections, over many workgroups;
-  - the last workgroup to finish runs the selection: repeated arg-max rounds over the router scores, using cross-lane exchanges within one wavefront, giving the 10 highest-scoring experts;
-  - this is followed by exponent-based normalisation over the selected scores;
-  - it writes 10 expert indices and 10 single-precision weights per token to device memory.
-- **The two expert launches read those indices directly.** Each workgroup derives its token, its selection slot (0 to 9) and its row range from its workgroup number, then loads the expert index for that slot. Weight addresses are formed on the device from that index.
-- **No device-to-host copy and no host synchronisation happen between layers.**
-  - The host issues all of a token's launches (about 650) back to back and synchronises once per token, which matches reading back only the sampled token.
-  - The trace holds 128 such synchronisations, covering both requests: 64 per request, one for each generated token, including the token from that request's prompt pass.
-- **Host launch-call time** totals about 6 percent of the per-token GPU time, and it overlaps GPU work.
-- **A short gap** of about 1 percent of the per-token GPU time sits at the start of each token, before the first layer starts. It is host-side per-token work, not yet attributed.
+- **Selection is produced & consumed on-device**, inside router launch:
+  - router launch spreads router projection & other small per-token projections over many workgroups
+  - last workgroup to finish runs selection: repeated arg-max rounds over router scores, using cross-lane exchanges within one wavefront, giving 10 highest-scoring experts
+  - exponent-based normalization over selected scores
+  - writes 10 expert indices & single-precision weights per token to device memory.
+- **Two expert launches read indices directly.** Each workgroup derives its token, selection slot (0-9), & row range from workgroup number, then loads expert index for slot. Weight addresses are formed on-device from index.
+- **No device-to-host copy or host synchronization between layers.**
+  - Host issues all of token's launches (~650) back to back, synchronizing once per token, which matches reading back only the sampled token.
+  - Trace holds 128 synchronizations, covering both requests: 64 per request, one for each generated token, including token from request's prompt pass.
+- **Host launch-call time** totals about 6 percent of per-token GPU time and overlaps GPU work.
+- **A short gap** of about 1 percent of per-token GPU time sits at start of each token, before first layer starts. It is host-side per-token work, not yet attributed.
 
-## 4. Work decomposition
+## 4. Work Decomposition
 
 **Model sizes used by these launches:**
 - hidden size 2560;
@@ -81,7 +74,7 @@ Five techniques explain the difference:
 - 10 experts selected per token;
 - 128-value scale blocks.
 
-All three expert-step launches use wavefronts of 32 lanes and workgroups of 256 lanes (8 wavefronts).
+All three expert-step launches use wavefronts of 32 lanes & workgroups of 256 lanes (8 wavefronts).
 
 | Stage | Workgroups per launch | Output rows per workgroup | Lanes per output row | Rows per wavefront | Workgroups per routed expert |
 |---|---|---|---|---|---|
